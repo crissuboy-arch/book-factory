@@ -1,0 +1,326 @@
+"""
+Gera capa + ilustrações via DALL-E 3 e exporta o livro em PDF diagramado.
+
+Uso:
+    python export_pdf.py --manuscript examples/amor-blindado/manuscrito.md
+"""
+
+import os
+import re
+import sys
+import argparse
+import requests
+from pathlib import Path
+from dotenv import load_dotenv
+from openai import OpenAI
+from fpdf import FPDF
+from PIL import Image
+
+# ── Configuração ──────────────────────────────────────────────────────────────
+
+load_dotenv()
+api_key = os.environ.get("OPENAI_API_KEY")
+if not api_key:
+    sys.exit("Erro: OPENAI_API_KEY não encontrada no arquivo .env")
+
+client = OpenAI(api_key=api_key)
+
+# ── Geração de imagens ────────────────────────────────────────────────────────
+
+def gerar_imagem(prompt: str, dest: Path, size: str = "1024x1792") -> Path:
+    """Chama DALL-E 3 e salva como JPEG. Pula se já existir."""
+    jpeg = dest.with_suffix(".jpg")
+    if jpeg.exists():
+        print(f"    (já existe, pulando) {jpeg.name}")
+        return jpeg
+
+    print(f"    Chamando DALL-E 3 para: {dest.name}...")
+    try:
+        resp = client.images.generate(
+            model="dall-e-3",
+            prompt=prompt,
+            size=size,
+            quality="hd",
+            n=1,
+        )
+        url = resp.data[0].url
+        raw = requests.get(url, timeout=60).content
+        dest.write_bytes(raw)
+        img = Image.open(dest).convert("RGB")
+        img.save(jpeg, "JPEG", quality=90)
+        dest.unlink()
+        return jpeg
+    except Exception as e:
+        print(f"    AVISO: falha ao gerar imagem — {e}")
+        return None
+
+
+# ── Parser do manuscrito ──────────────────────────────────────────────────────
+
+def parse_manuscrito(path: Path):
+    """
+    Lê o manuscrito e retorna (meta, capítulos).
+    Formato esperado:
+        # Título do livro
+        ## Subtítulo  →  texto
+        ## Biografia do Autor  →  texto (extrai nome da 1ª linha)
+        ## Capítulo N: Nome  →  corpo do capítulo
+        ### Descrição de imagem Capítulo N  →  descrição para DALL-E
+    """
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+
+    meta = {"genre": "autoajuda"}
+    chapters = []
+    current_ch = None
+    current_body = []
+    current_section = None   # controla seções de nível ##
+
+    for line in lines:
+        # Título do livro
+        if re.match(r"^# [^#]", line) and "title" not in meta:
+            parts = line[2:].split(":", 1)
+            meta["title"] = parts[0].strip()
+            if len(parts) > 1:
+                meta["subtitle"] = parts[1].strip()
+            current_section = None
+            continue
+
+        # Seções especiais de nível ##
+        if re.match(r"^## Subtítulo", line, re.IGNORECASE):
+            current_section = "subtitle"
+            continue
+        if re.match(r"^## Sinopse", line, re.IGNORECASE):
+            current_section = "synopsis"
+            continue
+        if re.match(r"^## Biografia", line, re.IGNORECASE):
+            current_section = "bio"
+            continue
+        if re.match(r"^## Índice", line, re.IGNORECASE):
+            current_section = "index"
+            continue
+
+        # Capítulos
+        m_cap = re.match(r"^## (Capítulo|Chapter)\s+(\d+)[:\-–]?\s*(.*)", line, re.IGNORECASE)
+        if m_cap:
+            if current_ch is not None:
+                current_ch["body"] = "\n".join(current_body).strip()
+                chapters.append(current_ch)
+            current_ch = {
+                "number": int(m_cap.group(2)),
+                "title": m_cap.group(3).strip(),
+                "image_desc": "",
+            }
+            current_body = []
+            current_section = "chapter"
+            continue
+
+        # Descrição de imagem dentro do capítulo
+        if current_section == "chapter" and re.match(
+            r"^### Descrição de imagem", line, re.IGNORECASE
+        ):
+            current_section = "image_desc"
+            continue
+
+        # Acumula conteúdo conforme a seção
+        if current_section == "subtitle" and line.strip():
+            meta["subtitle"] = meta.get("subtitle", "") + line.strip()
+        elif current_section == "bio" and line.strip():
+            # Primeira linha não-vazia do bio é usada como autor
+            if "author" not in meta:
+                # Ex: "Paula Monteiro é coach..."  → pega as 2 primeiras palavras
+                words = line.strip().split()
+                meta["author"] = " ".join(words[:2]) if len(words) >= 2 else words[0]
+        elif current_section == "chapter":
+            current_body.append(line)
+        elif current_section == "image_desc" and line.strip():
+            if current_ch:
+                current_ch["image_desc"] += line.strip() + " "
+            current_section = "chapter"  # volta ao corpo após 1 parágrafo
+
+    # Último capítulo
+    if current_ch is not None:
+        current_ch["body"] = "\n".join(current_body).strip()
+        chapters.append(current_ch)
+
+    return meta, chapters
+
+
+# ── Construção do PDF ─────────────────────────────────────────────────────────
+
+# Fontes Unicode (Arial do Windows suporta português completo)
+_FONT_DIR = Path("C:/Windows/Fonts")
+_USE_UNICODE = (_FONT_DIR / "arial.ttf").exists()
+
+
+class LivroPDF(FPDF):
+    def __init__(self, titulo, autor):
+        super().__init__(orientation="P", unit="mm", format=(148, 210))
+        self.livro_titulo = titulo
+        self.livro_autor = autor
+        self.set_auto_page_break(auto=True, margin=18)
+        self.set_margins(18, 18, 18)
+        if _USE_UNICODE:
+            self.add_font("Arial", "", str(_FONT_DIR / "arial.ttf"))
+            self.add_font("Arial", "B", str(_FONT_DIR / "arialbd.ttf"))
+            self.add_font("Arial", "I", str(_FONT_DIR / "ariali.ttf"))
+            self._fn = "Arial"
+        else:
+            self._fn = "Helvetica"   # fallback latin-1
+
+    def _font(self, style="", size=10):
+        """Define a fonte correta (Unicode ou fallback)."""
+        self.set_font(self._fn, style, size)
+
+    def header(self):
+        if self.page_no() > 1:
+            self._font("I", 7)
+            self.set_text_color(140)
+            self.cell(0, 5, f"{self.livro_titulo} | {self.livro_autor}", align="C")
+            self.ln(3)
+            self.set_text_color(0)
+
+    def footer(self):
+        self.set_y(-14)
+        self._font("I", 8)
+        self.set_text_color(140)
+        self.cell(0, 8, str(self.page_no()), align="C")
+        self.set_text_color(0)
+
+    def pagina_capa(self, img_path: Path, titulo, subtitulo, autor):
+        self.add_page()
+        tem_imagem = img_path and Path(img_path).exists()
+        if tem_imagem:
+            self.image(str(img_path), x=0, y=0, w=self.w, h=self.h)
+        # Repõe margens e posição após imagem full-page
+        self.set_margins(18, 18, 18)
+        self.set_xy(18, 20)
+        w_util = self.w - 36
+        cor_texto = (255, 255, 255) if tem_imagem else (20, 20, 60)
+        self.set_text_color(*cor_texto)
+        # Título
+        self._font("B", 20)
+        self.multi_cell(w_util, 10, titulo, align="C")
+        # Subtítulo (1ª frase apenas)
+        if subtitulo:
+            sub = subtitulo.split(".")[0].strip()
+            self._font("I", 11)
+            self.set_x(18)
+            self.multi_cell(w_util, 6, sub, align="C")
+        # Autor na base — usa set_xy para garantir posição
+        self.set_xy(18, self.h - 22)
+        self._font("B", 11)
+        self.cell(w_util, 8, autor, align="C")
+        self.set_text_color(0)
+
+    def pagina_capitulo(self, numero, titulo, corpo, img_path: Path):
+        self.add_page()
+        # Cabeçalho do capítulo
+        self._font("B", 14)
+        self.set_text_color(30, 30, 80)
+        self.multi_cell(0, 8, f"Capítulo {numero}", align="C")
+        self._font("B", 12)
+        self.multi_cell(0, 7, titulo, align="C")
+        self.set_text_color(0)
+        self.ln(3)
+        # Ilustração
+        if img_path and img_path.exists():
+            largura = self.w - 36
+            self.image(str(img_path), x=18, w=largura)
+            self.ln(4)
+        # Corpo do texto
+        self._font("", 10)
+        for paragrafo in corpo.split("\n"):
+            paragrafo = paragrafo.strip()
+            if not paragrafo:
+                self.ln(2)
+                continue
+            # Remove marcadores markdown
+            paragrafo = re.sub(r"^#{1,4}\s*", "", paragrafo)
+            paragrafo = re.sub(r"\*\*(.*?)\*\*", r"\1", paragrafo)
+            paragrafo = re.sub(r"\*(.*?)\*", r"\1", paragrafo)
+            paragrafo = re.sub(r"^[-•]\s+", "• ", paragrafo)
+            self.multi_cell(0, 5.5, paragrafo)
+            self.ln(1)
+
+
+# ── Pipeline principal ────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="Exporta manuscrito para PDF com imagens DALL-E 3")
+    parser.add_argument("--manuscript", default="examples/amor-blindado/manuscrito.md",
+                        help="Caminho para o manuscrito.md")
+    args = parser.parse_args()
+
+    manuscrito = Path(args.manuscript)
+    if not manuscrito.exists():
+        sys.exit(f"Arquivo não encontrado: {manuscrito}")
+
+    saida_dir = manuscrito.parent / "output"
+    imagens_dir = saida_dir / "images"
+    saida_dir.mkdir(exist_ok=True)
+    imagens_dir.mkdir(exist_ok=True)
+
+    print(f"\nLendo manuscrito: {manuscrito}")
+    meta, capitulos = parse_manuscrito(manuscrito)
+
+    titulo    = meta.get("title", "Sem Título")
+    subtitulo = meta.get("subtitle", "")
+    autor     = meta.get("author", "Autor")
+    genero    = meta.get("genre", "autoajuda")
+
+    print(f"Livro: {titulo}")
+    print(f"Autor: {autor}")
+    print(f"Capítulos encontrados: {len(capitulos)}\n")
+
+    # ── 1. Capa ──
+    print("[ 1/2 ] Gerando capa...")
+    prompt_capa = (
+        f"Professional book cover for a self-help book titled '{titulo}' by {autor}. "
+        f"Subtitle: '{subtitulo}'. "
+        "Style: warm, modern, Brazilian aesthetic, inspirational. "
+        "Elegant typography space at top for title, bottom for author name. "
+        "Publishing quality. No text or letters anywhere in the image."
+    )
+    capa_path = gerar_imagem(prompt_capa, imagens_dir / "cover.png", size="1024x1792")
+
+    # ── 2. Ilustrações por capítulo ──
+    print(f"\n[ 2/2 ] Gerando {len(capitulos)} ilustrações de capítulos...")
+    for cap in capitulos:
+        desc = cap["image_desc"] or f"Cena do capítulo {cap['number']}: {cap['title']}"
+        prompt_cap = (
+            f"Book illustration for a Brazilian self-help book, chapter {cap['number']}: "
+            f"'{cap['title']}'. Scene: {desc} "
+            "Warm realistic style, publishing quality. No text."
+        )
+        img = gerar_imagem(
+            prompt_cap,
+            imagens_dir / f"chapter_{cap['number']}.png",
+            size="1792x1024",
+        )
+        cap["img_path"] = img
+
+    # ── 3. Montar PDF ──
+    print("\n[ 3/3 ] Montando PDF...")
+    pdf = LivroPDF(titulo, autor)
+
+    pdf.pagina_capa(capa_path, titulo, subtitulo, autor)
+
+    for cap in capitulos:
+        pdf.pagina_capitulo(
+            cap["number"],
+            cap["title"],
+            cap["body"],
+            cap.get("img_path"),
+        )
+
+    nome_pdf = re.sub(r"[^\w\-]", "_", titulo) + ".pdf"
+    pdf_path = saida_dir / nome_pdf
+    pdf.output(str(pdf_path))
+
+    print(f"\nPDF gerado com sucesso:")
+    print(f"  {pdf_path.resolve()}\n")
+
+
+if __name__ == "__main__":
+    main()

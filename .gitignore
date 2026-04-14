@@ -1,0 +1,21 @@
+# Variáveis de ambiente e segredos
+.env
+.env.local
+.env.*.local
+
+# Arquivos gerados
+output/
+generated/
+*.pdf
+*.epub
+*.docx
+
+# Dependências
+node_modules/
+__pycache__/
+*.pyc
+
+# Editores
+.vscode/
+.idea/
+*.swp
